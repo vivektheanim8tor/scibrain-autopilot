@@ -605,10 +605,10 @@ def main():
         yt_id = None
         if not next_item.get("youtube_posted_at"):
             try:
-                token_json = os.environ.get("GOOGLE_TOKEN_JSON")
-                if token_json:
-                    creds_info = json.loads(token_json)
-                    creds = Credentials.from_authorized_user_info(creds_info, scopes=SCOPES + ['https://www.googleapis.com/auth/youtube.upload'])
+                yt_token_json = os.environ.get("YOUTUBE_TOKEN_JSON") or os.environ.get("GOOGLE_TOKEN_JSON")
+                if yt_token_json:
+                    creds_info = json.loads(yt_token_json)
+                    creds = Credentials.from_authorized_user_info(creds_info, scopes=['https://www.googleapis.com/auth/youtube.upload'])
                     if creds and creds.expired and creds.refresh_token:
                         creds.refresh(Request())
                     yt_id = publish_to_youtube_shorts(creds, local_video_path, yt_title, caption, yt_tags, local_thumb_path)
