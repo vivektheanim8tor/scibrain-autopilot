@@ -585,19 +585,25 @@ def main():
         if len(yt_title) > 95:
             yt_title = yt_title[:95]
             
-        yt_tags = "science, scibrain, human body, did you know, neuroscience, interesting facts, biology, brain facts, science facts, shorts"
+        ig_caption = next_item.get("instagram_caption", caption)
+        yt_desc = next_item.get("youtube_description", caption)
+        yt_tags_list = next_item.get("youtube_tags")
+        if yt_tags_list:
+            yt_tags = ", ".join(yt_tags_list)
+        else:
+            yt_tags = "science, scibrain, human body, did you know, neuroscience, interesting facts, biology, brain facts, science facts, shorts"
 
         # Publish to Instagram Reels (Meta Graph API)
         ig_ok = False
         if meta_cfg and not next_item.get("posted_at") and not next_item.get("instagram_posted_at"):
-            ig_ok = publish_to_instagram_reels(meta_cfg, local_video_path, caption, thumb_offset_ms=2000)
+            ig_ok = publish_to_instagram_reels(meta_cfg, local_video_path, ig_caption, thumb_offset_ms=2000)
         else:
             log("Instagram Reel already published for this day.")
 
         # Publish to Facebook Page Reels (Meta Graph API)
         fb_ok = False
         if meta_cfg and not next_item.get("facebook_posted_at"):
-            fb_ok = publish_to_facebook_page(meta_cfg, local_video_path, caption, thumb_path=local_thumb_path)
+            fb_ok = publish_to_facebook_page(meta_cfg, local_video_path, ig_caption, thumb_path=local_thumb_path)
         else:
             log("Facebook Reel already published for this day.")
 
@@ -611,7 +617,7 @@ def main():
                     creds = Credentials.from_authorized_user_info(creds_info, scopes=['https://www.googleapis.com/auth/youtube.upload'])
                     if creds and creds.expired and creds.refresh_token:
                         creds.refresh(Request())
-                    yt_id = publish_to_youtube_shorts(creds, local_video_path, yt_title, caption, yt_tags, local_thumb_path)
+                    yt_id = publish_to_youtube_shorts(creds, local_video_path, yt_title, yt_desc, yt_tags, local_thumb_path)
             except Exception as yt_err:
                 log(f"[WARNING] YouTube publishing error: {yt_err}")
         else:
