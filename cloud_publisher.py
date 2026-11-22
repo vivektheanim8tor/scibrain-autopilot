@@ -2,10 +2,10 @@
 Sci.Brain - Cloud Daily Publisher
 ---------------------------------
 Executes 100% autonomously in GitHub Actions.
-Pulls today's scheduled science fact reel from Google Drive, publishes to:
-- Instagram Reels (@sci.brain via Meta Graph API)
-- Facebook Page Reels (Sci.Brain via Meta Graph API)
-- YouTube Shorts (Sci.Brain via official YouTube Data API v3)
+Pulls today's scheduled science fact kit from Google Drive and publishes to:
+- Instagram (@sci.brain via Meta Graph API: Reels for video shorts, Carousel containers for multi-slide carousels)
+- Facebook Page (Sci.Brain via Meta Graph API: Video Reels for shorts, Multi-photo feed posts for carousels)
+- YouTube Shorts (Sci.Brain via official YouTube Data API v3 for video shorts; skipped for carousels)
 Updates and saves master queue.json back to Google Drive.
 """
 
@@ -115,7 +115,7 @@ def save_queue_to_drive(service, queue_file_id, folder_id, queue_data):
         except Exception:
             pass
 
-# ----------------- Meta Graph API Publishing -----------------
+# ----------------- Meta Graph API: Video Reels -----------------
 def publish_to_facebook_page(meta_cfg, video_path, caption, thumb_path=None):
     page_id = meta_cfg["facebook_page_id"]
     token = meta_cfg["facebook_page_access_token"]
@@ -238,6 +238,150 @@ def publish_to_instagram_reels(meta_cfg, video_path, caption, thumb_offset_ms=20
         log(f"[ERROR] IG publish failed: {r_pub.text}")
         return False
 
+# ----------------- Meta Graph API: Carousels -----------------
+def publish_to_facebook_carousel(meta_cfg, slide_paths, caption, pinned_comment=None):
+    """
+    Publishes a multi-photo carousel post to Facebook Page.
+    1. Uploads each photo as published=false to obtain photo FBIDs.
+    2. Queries each photo to retrieve its Meta CDN URL (for Instagram carousel ingestion).
+    3. Creates multi-photo feed post attached_media=[{"media_fbid": id}, ...].
+    4. Posts pinned conversation-starter comment.
+    Returns: (post_id, cdn_urls)
+    """
+    page_id = meta_cfg["facebook_page_id"]
+    token = meta_cfg["facebook_page_access_token"]
+    photo_ids = []
+    cdn_urls = []
+
+    log(f"Uploading {len(slide_paths)} carousel slides to Facebook Page...")
+    upload_url = f"https://graph.facebook.com/v21.0/{page_id}/photos"
+
+    for idx, spath in enumerate(slide_paths):
+        log(f"Uploading slide {idx+1}/{len(slide_paths)}: {os.path.basename(spath)}...")
+        with open(spath, "rb") as sf:
+            r = requests.post(
+                upload_url,
+                data={"published": "false", "access_token": token},
+                files={"source": sf}
+            )
+        if r.status_code != 200:
+            log(f"[ERROR] FB photo upload failed for slide {idx+1}: {r.text}")
+            return None, []
+        pid = r.json().get("id")
+        photo_ids.append(pid)
+
+        # Retrieve CDN URL for Instagram ingestion
+        r_img = requests.get(
+            f"https://graph.facebook.com/v21.0/{pid}",
+            params={"fields": "images", "access_token": token}
+        )
+        if r_img.status_code == 200 and "images" in r_img.json():
+            imgs = r_img.json()["images"]
+            cdn_url = imgs[0]["source"]
+            cdn_urls.append(cdn_url)
+        else:
+            log(f"[WARNING] Could not fetch CDN URL for photo {pid}: {r_img.text}")
+
+    # Create multi-photo feed post
+    log("Creating Facebook Page multi-photo carousel post...")
+    feed_url = f"https://graph.facebook.com/v21.0/{page_id}/feed"
+    attached = [{"media_fbid": pid} for pid in photo_ids]
+    r_post = requests.post(
+        feed_url,
+        json={
+            "message": caption,
+            "attached_media": attached,
+            "access_token": token
+        }
+    )
+    if r_post.status_code == 200 and "id" in r_post.json():
+        post_id = r_post.json()["id"]
+        log(f"[SUCCESS] Facebook multi-photo carousel published! Post ID: {post_id}")
+
+        # Post pinned comment if available
+        if pinned_comment:
+            try:
+                c_url = f"https://graph.facebook.com/v21.0/{post_id}/comments"
+                r_c = requests.post(c_url, data={"message": pinned_comment, "access_token": token})
+                if r_c.status_code == 200:
+                    log("Pinned comment posted to Facebook carousel post!")
+            except Exception as e_c:
+                log(f"[NOTE] FB pinned comment note: {e_c}")
+
+        return post_id, cdn_urls
+    else:
+        log(f"[ERROR] Facebook feed post creation failed: {r_post.text}")
+        return None, cdn_urls
+
+def publish_to_instagram_carousel(meta_cfg, cdn_urls, caption, pinned_comment=None):
+    """
+    Publishes a multi-slide carousel to Instagram:
+    1. Creates child image item containers with is_carousel_item=true.
+    2. Creates parent carousel container with media_type=CAROUSEL and children=[ids].
+    3. Publishes container via media_publish.
+    4. Posts pinned conversation-starter comment.
+    """
+    ig_id = meta_cfg["instagram_account_id"]
+    token = meta_cfg["facebook_page_access_token"]
+    child_container_ids = []
+
+    log(f"Creating {len(cdn_urls)} Instagram carousel item containers...")
+    item_url = f"https://graph.facebook.com/v21.0/{ig_id}/media"
+
+    for idx, curl in enumerate(cdn_urls):
+        r_item = requests.post(
+            item_url,
+            data={
+                "image_url": curl,
+                "is_carousel_item": "true",
+                "access_token": token
+            }
+        )
+        if r_item.status_code != 200:
+            log(f"[ERROR] IG carousel child {idx+1} creation failed: {r_item.text}")
+            return False
+        child_id = r_item.json().get("id")
+        child_container_ids.append(child_id)
+
+    log(f"Creating Instagram carousel parent container for {len(child_container_ids)} slides...")
+    r_parent = requests.post(
+        item_url,
+        data={
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_container_ids),
+            "caption": caption,
+            "access_token": token
+        }
+    )
+    if r_parent.status_code != 200:
+        log(f"[ERROR] IG carousel parent container creation failed: {r_parent.text}")
+        return False
+    carousel_container_id = r_parent.json().get("id")
+
+    # Small sleep to let Meta finish bundling the container
+    time.sleep(10)
+
+    log("Publishing carousel container to Instagram profile...")
+    pub_url = f"https://graph.facebook.com/v21.0/{ig_id}/media_publish"
+    r_pub = requests.post(pub_url, data={"creation_id": carousel_container_id, "access_token": token})
+    if r_pub.status_code == 200 and "id" in r_pub.json():
+        media_id = r_pub.json().get("id")
+        log(f"[SUCCESS] Instagram Carousel published! Media ID: {media_id}")
+
+        if pinned_comment:
+            try:
+                c_url = f"https://graph.facebook.com/v21.0/{media_id}/comments"
+                r_c = requests.post(c_url, data={"message": pinned_comment, "access_token": token})
+                if r_c.status_code == 200:
+                    log("Pinned comment posted to Instagram carousel!")
+            except Exception as e_c:
+                log(f"[NOTE] IG pinned comment note: {e_c}")
+
+        return True
+    else:
+        log(f"[ERROR] IG carousel publish failed: {r_pub.text}")
+        return False
+
 # ----------------- YouTube Data API v3 Publishing -----------------
 def publish_to_youtube_shorts(creds, video_path, title, description, tags, thumb_path=None):
     try:
@@ -302,14 +446,14 @@ def main():
     queue = json.loads(q_content.decode("utf-8"))
     pending = [r for r in queue if r.get("status") == "pending"]
     if not pending:
-        log("[NOTICE] All reels in queue are already posted. Nothing to publish.")
+        log("[NOTICE] All items in queue are already posted. Nothing to publish.")
         return
 
-    next_reel = pending[0]
+    next_item = pending[0]
     now_ist = datetime.now(IST)
 
     # 3. Schedule target check
-    target_str = next_reel.get("scheduled_for")
+    target_str = next_item.get("scheduled_for")
     target_dt = None
     if target_str:
         try:
@@ -319,47 +463,17 @@ def main():
 
     if not target_dt or target_dt.date() < now_ist.date():
         target_dt = get_random_target_for_day(now_ist)
-        next_reel["scheduled_for"] = target_dt.isoformat()
-        log(f"Generated new organic target for Reel #{next_reel['id']}: {target_dt.strftime('%I:%M:%S %p')} IST")
+        next_item["scheduled_for"] = target_dt.isoformat()
+        log(f"Generated new organic target for Item #{next_item['id']}: {target_dt.strftime('%I:%M:%S %p')} IST")
         save_queue_to_drive(service, q_file_id, folder_id, queue)
 
     if now_ist < target_dt:
         diff_mins = int((target_dt - now_ist).total_seconds() // 60)
-        log(f"Today's upload (Reel #{next_reel['id']}) is organically scheduled for {target_dt.strftime('%I:%M:%S %p')} IST (~{diff_mins} mins remaining). Standing by.")
+        log(f"Today's upload (Day #{next_item['id']} - {next_item['title']}) is organically scheduled for {target_dt.strftime('%I:%M:%S %p')} IST (~{diff_mins} mins remaining). Standing by.")
         return
 
-    log(f"Scheduled target time ({target_dt.strftime('%I:%M:%S %p')} IST) reached! Publishing Day {next_reel['id']} - {next_reel['title']}...")
-
-    # 4. Download video file from Drive
-    raw_filename = next_reel.get("video_filename", "reel.mp4").replace('\\', '/').split('/')[-1]
-    local_video_path = os.path.join(".", raw_filename)
-    log(f"Downloading {raw_filename} from Google Drive...")
-    download_file_by_name(service, folder_id, raw_filename, local_video_path, file_id=next_reel.get("video_file_id"))
-    log(f"Downloaded {raw_filename} ({os.path.getsize(local_video_path) // (1024*1024)} MB)")
-
-    # 5. Download custom thumbnail if available
-    local_thumb_path = None
-    if next_reel.get("thumb_filename"):
-        thumb_name = next_reel["thumb_filename"].replace('\\', '/').split('/')[-1]
-        local_thumb_path = os.path.join(".", thumb_name)
-        try:
-            download_file_by_name(service, folder_id, thumb_name, local_thumb_path, file_id=next_reel.get("thumb_file_id"))
-            log(f"Downloaded custom thumbnail: {thumb_name}")
-        except Exception as thumb_err:
-            log(f"[WARNING] Could not download thumbnail {thumb_name}: {thumb_err}")
-            local_thumb_path = None
-
-    # 6. Captions & Titles
-    caption = next_reel.get("caption", "")
-    hook = next_reel.get("hook", next_reel.get("title", ""))
-    
-    yt_title = next_reel.get("title", hook)
-    if "#Shorts" not in yt_title:
-        yt_title = f"{yt_title} #Shorts"
-    if len(yt_title) > 95:
-        yt_title = yt_title[:95]
-        
-    yt_tags = "science, scibrain, human body, did you know, neuroscience, interesting facts, biology, brain facts, science facts, shorts"
+    content_type = next_item.get("content_type", "10s_short")
+    log(f"Scheduled target time ({target_dt.strftime('%I:%M:%S %p')} IST) reached! Publishing Day {next_item['id']} [{content_type.upper()}] - {next_item['title']}...")
 
     # Load Meta config
     meta_json = os.environ.get("META_CONFIG_JSON")
@@ -368,75 +482,179 @@ def main():
         with open("scibrain_meta_config.json") as f:
             meta_cfg = json.load(f)
 
-    # 7. Publish to Instagram Reels (Meta Graph API)
-    ig_ok = False
-    if meta_cfg and not next_reel.get("posted_at") and not next_reel.get("instagram_posted_at"):
-        ig_ok = publish_to_instagram_reels(meta_cfg, local_video_path, caption, thumb_offset_ms=2000)
+    caption = next_item.get("caption", "")
+    pinned_comment = next_item.get("pinned_comment", "")
+
+    # ==================== CASE A: MULTI-SLIDE CAROUSEL ====================
+    if content_type == "carousel":
+        slides = next_item.get("slides", [])
+        if not slides:
+            log(f"[ERROR] Carousel item {next_item['id']} has no slides configured.")
+            sys.exit(1)
+
+        log(f"Downloading {len(slides)} slides for carousel from Google Drive...")
+        downloaded_slides = []
+        for s in slides:
+            s_name = s["name"]
+            local_s_path = os.path.join(".", s_name)
+            download_file_by_name(service, folder_id, s_name, local_s_path, file_id=s.get("file_id"))
+            downloaded_slides.append(local_s_path)
+            log(f"  - Downloaded {s_name} ({os.path.getsize(local_s_path) // 1024} KB)")
+
+        # 1. Publish to Facebook Page multi-photo post and obtain Meta CDN URLs
+        fb_post_id, cdn_urls = None, []
+        if meta_cfg and not next_item.get("facebook_posted_at"):
+            fb_post_id, cdn_urls = publish_to_facebook_carousel(meta_cfg, downloaded_slides, caption, pinned_comment=pinned_comment)
+        else:
+            log("Facebook Carousel already published for this day.")
+
+        # 2. Publish to Instagram Carousel using Meta CDN URLs
+        ig_ok = False
+        if meta_cfg and not next_item.get("instagram_posted_at"):
+            if cdn_urls:
+                ig_ok = publish_to_instagram_carousel(meta_cfg, cdn_urls, caption, pinned_comment=pinned_comment)
+            else:
+                log("[ERROR] Cannot publish Instagram Carousel: no CDN URLs retrieved from Facebook.")
+        else:
+            log("Instagram Carousel already published for this day.")
+
+        # YouTube does not support image carousels
+        next_item["youtube_posted_at"] = "not_applicable"
+
+        # Update queue state
+        now_iso = now_ist.isoformat()
+        updated = False
+        if ig_ok:
+            next_item["instagram_posted_at"] = now_iso
+            updated = True
+        if fb_post_id:
+            next_item["facebook_posted_at"] = now_iso
+            updated = True
+
+        if next_item.get("instagram_posted_at") or next_item.get("facebook_posted_at"):
+            next_item["status"] = "posted"
+            next_item["posted_at"] = now_iso
+
+            tomorrow_ist = now_ist + timedelta(days=1)
+            remaining = [r for r in queue if r.get("status") == "pending"]
+            if remaining:
+                tomorrow_target = get_random_target_for_day(tomorrow_ist)
+                remaining[0]["scheduled_for"] = tomorrow_target.isoformat()
+                log(f"Pre-scheduled tomorrow's Day #{remaining[0]['id']} for: {tomorrow_target.strftime('%Y-%m-%d %I:%M:%S %p')} IST")
+
+            log("Saving updated queue.json back to Google Drive...")
+            save_queue_to_drive(service, q_file_id, folder_id, queue)
+            log(f"[SUCCESS] Day {next_item['id']} Carousel published successfully across Meta and cloud queue updated!")
+        else:
+            log("[ERROR] Carousel publishing failed. Queue not updated.")
+            sys.exit(1)
+
+        # Cleanup local slide files
+        for sp in downloaded_slides:
+            if os.path.exists(sp):
+                try:
+                    os.remove(sp)
+                except Exception:
+                    pass
+
+    # ==================== CASE B: VIDEO SHORTS (10s or 20-30s) ====================
     else:
-        log("Instagram Reel already published for this day.")
+        # Download video file from Drive
+        raw_filename = next_item.get("video_filename", "reel.mp4").replace('\\', '/').split('/')[-1]
+        local_video_path = os.path.join(".", raw_filename)
+        log(f"Downloading {raw_filename} from Google Drive...")
+        download_file_by_name(service, folder_id, raw_filename, local_video_path, file_id=next_item.get("video_file_id"))
+        log(f"Downloaded {raw_filename} ({os.path.getsize(local_video_path) // (1024*1024)} MB)")
 
-    # 8. Publish to Facebook Page Reels (Meta Graph API)
-    fb_ok = False
-    if meta_cfg and not next_reel.get("facebook_posted_at"):
-        fb_ok = publish_to_facebook_page(meta_cfg, local_video_path, caption, thumb_path=local_thumb_path)
-    else:
-        log("Facebook Reel already published for this day.")
+        # Download custom thumbnail if available
+        local_thumb_path = None
+        if next_item.get("thumb_filename"):
+            thumb_name = next_item["thumb_filename"].replace('\\', '/').split('/')[-1]
+            local_thumb_path = os.path.join(".", thumb_name)
+            try:
+                download_file_by_name(service, folder_id, thumb_name, local_thumb_path, file_id=next_item.get("thumb_file_id"))
+                log(f"Downloaded custom thumbnail: {thumb_name}")
+            except Exception as thumb_err:
+                log(f"[WARNING] Could not download thumbnail {thumb_name}: {thumb_err}")
+                local_thumb_path = None
 
-    # 9. Publish to YouTube Shorts (YouTube Data API v3)
-    yt_id = None
-    if not next_reel.get("youtube_posted_at"):
-        try:
-            token_json = os.environ.get("GOOGLE_TOKEN_JSON")
-            if token_json:
-                creds_info = json.loads(token_json)
-                creds = Credentials.from_authorized_user_info(creds_info, scopes=SCOPES + ['https://www.googleapis.com/auth/youtube.upload'])
-                if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                yt_id = publish_to_youtube_shorts(creds, local_video_path, yt_title, caption, yt_tags, local_thumb_path)
-        except Exception as yt_err:
-            log(f"[WARNING] YouTube publishing error: {yt_err}")
-    else:
-        log(f"YouTube Short already published for this day ({next_reel.get('youtube_posted_at')}).")
+        hook = next_item.get("hook", next_item.get("title", ""))
+        yt_title = next_item.get("title", hook)
+        if "#Shorts" not in yt_title:
+            yt_title = f"{yt_title} #Shorts"
+        if len(yt_title) > 95:
+            yt_title = yt_title[:95]
+            
+        yt_tags = "science, scibrain, human body, did you know, neuroscience, interesting facts, biology, brain facts, science facts, shorts"
 
-    # 10. Update queue
-    now_iso = now_ist.isoformat()
-    updated = False
-    if ig_ok:
-        next_reel["status"] = "posted"
-        next_reel["posted_at"] = now_iso
-        next_reel["instagram_posted_at"] = now_iso
-        updated = True
-    if fb_ok:
-        next_reel["facebook_posted_at"] = now_iso
-        updated = True
-    if yt_id:
-        next_reel["youtube_posted_at"] = now_iso
-        updated = True
+        # Publish to Instagram Reels (Meta Graph API)
+        ig_ok = False
+        if meta_cfg and not next_item.get("posted_at") and not next_item.get("instagram_posted_at"):
+            ig_ok = publish_to_instagram_reels(meta_cfg, local_video_path, caption, thumb_offset_ms=2000)
+        else:
+            log("Instagram Reel already published for this day.")
 
-    if next_reel.get("posted_at") or (next_reel.get("facebook_posted_at") and next_reel.get("youtube_posted_at")):
-        next_reel["status"] = "posted"
+        # Publish to Facebook Page Reels (Meta Graph API)
+        fb_ok = False
+        if meta_cfg and not next_item.get("facebook_posted_at"):
+            fb_ok = publish_to_facebook_page(meta_cfg, local_video_path, caption, thumb_path=local_thumb_path)
+        else:
+            log("Facebook Reel already published for this day.")
 
-    if updated or next_reel.get("status") == "posted":
-        # Pre-schedule tomorrow's organic target time
-        tomorrow_ist = now_ist + timedelta(days=1)
-        remaining = [r for r in queue if r.get("status") == "pending"]
-        if remaining:
-            tomorrow_target = get_random_target_for_day(tomorrow_ist)
-            remaining[0]["scheduled_for"] = tomorrow_target.isoformat()
-            log(f"Pre-scheduled tomorrow's Reel #{remaining[0]['id']} for: {tomorrow_target.strftime('%Y-%m-%d %I:%M:%S %p')} IST (organic randomized time)")
+        # Publish to YouTube Shorts (YouTube Data API v3)
+        yt_id = None
+        if not next_item.get("youtube_posted_at"):
+            try:
+                token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+                if token_json:
+                    creds_info = json.loads(token_json)
+                    creds = Credentials.from_authorized_user_info(creds_info, scopes=SCOPES + ['https://www.googleapis.com/auth/youtube.upload'])
+                    if creds and creds.expired and creds.refresh_token:
+                        creds.refresh(Request())
+                    yt_id = publish_to_youtube_shorts(creds, local_video_path, yt_title, caption, yt_tags, local_thumb_path)
+            except Exception as yt_err:
+                log(f"[WARNING] YouTube publishing error: {yt_err}")
+        else:
+            log(f"YouTube Short already published for this day ({next_item.get('youtube_posted_at')}).")
 
-        log("Saving updated queue.json back to Google Drive...")
-        save_queue_to_drive(service, q_file_id, folder_id, queue)
-        log(f"[SUCCESS] Day {next_reel['id']} published successfully across platforms and cloud queue updated!")
-    else:
-        log("[ERROR] Publishing failed for pending platforms. Queue not updated.")
-        sys.exit(1)
+        # Update queue
+        now_iso = now_ist.isoformat()
+        updated = False
+        if ig_ok:
+            next_item["status"] = "posted"
+            next_item["posted_at"] = now_iso
+            next_item["instagram_posted_at"] = now_iso
+            updated = True
+        if fb_ok:
+            next_item["facebook_posted_at"] = now_iso
+            updated = True
+        if yt_id:
+            next_item["youtube_posted_at"] = now_iso
+            updated = True
 
-    # Clean up local temporary files
-    if os.path.exists(local_video_path):
-        os.remove(local_video_path)
-    if local_thumb_path and os.path.exists(local_thumb_path):
-        os.remove(local_thumb_path)
+        if next_item.get("posted_at") or (next_item.get("facebook_posted_at") and next_item.get("youtube_posted_at")):
+            next_item["status"] = "posted"
+
+        if updated or next_item.get("status") == "posted":
+            tomorrow_ist = now_ist + timedelta(days=1)
+            remaining = [r for r in queue if r.get("status") == "pending"]
+            if remaining:
+                tomorrow_target = get_random_target_for_day(tomorrow_ist)
+                remaining[0]["scheduled_for"] = tomorrow_target.isoformat()
+                log(f"Pre-scheduled tomorrow's Day #{remaining[0]['id']} for: {tomorrow_target.strftime('%Y-%m-%d %I:%M:%S %p')} IST")
+
+            log("Saving updated queue.json back to Google Drive...")
+            save_queue_to_drive(service, q_file_id, folder_id, queue)
+            log(f"[SUCCESS] Day {next_item['id']} published successfully across platforms and cloud queue updated!")
+        else:
+            log("[ERROR] Publishing failed for pending platforms. Queue not updated.")
+            sys.exit(1)
+
+        # Cleanup local video files
+        if os.path.exists(local_video_path):
+            os.remove(local_video_path)
+        if local_thumb_path and os.path.exists(local_thumb_path):
+            os.remove(local_thumb_path)
 
 if __name__ == "__main__":
     main()
