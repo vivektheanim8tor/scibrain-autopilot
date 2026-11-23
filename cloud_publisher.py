@@ -358,8 +358,27 @@ def publish_to_instagram_carousel(meta_cfg, cdn_urls, caption, pinned_comment=No
         return False
     carousel_container_id = r_parent.json().get("id")
 
-    # Small sleep to let Meta finish bundling the container
-    time.sleep(10)
+    # Poll status to ensure Meta finishes processing all carousel slides
+    log(f"Waiting for Instagram carousel container ({carousel_container_id}) processing...")
+    status_url = f"https://graph.facebook.com/v21.0/{carousel_container_id}"
+    ready = False
+    for attempt in range(25):
+        time.sleep(3)
+        r_stat = requests.get(status_url, params={"fields": "status_code,status", "access_token": token})
+        if r_stat.status_code == 200:
+            s_code = r_stat.json().get("status_code")
+            log(f"Carousel status poll: {s_code} ({attempt+1}/25)")
+            if s_code == "FINISHED":
+                ready = True
+                break
+            elif s_code == "ERROR":
+                log(f"[ERROR] IG carousel processing error: {r_stat.text}")
+                return False
+        else:
+            log(f"[WARNING] Carousel status poll response: {r_stat.text}")
+
+    if not ready:
+        log("[WARNING] Status polling finished, attempting to publish carousel container...")
 
     log("Publishing carousel container to Instagram profile...")
     pub_url = f"https://graph.facebook.com/v21.0/{ig_id}/media_publish"
@@ -482,7 +501,7 @@ def main():
         with open("scibrain_meta_config.json") as f:
             meta_cfg = json.load(f)
 
-    caption = next_item.get("caption", "")
+    caption = next_item.get("instagram_caption", next_item.get("caption", ""))
     pinned_comment = next_item.get("pinned_comment", "")
 
     # ==================== CASE A: MULTI-SLIDE CAROUSEL ====================
