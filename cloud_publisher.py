@@ -486,10 +486,13 @@ def main():
         log(f"Generated new organic target for Item #{next_item['id']}: {target_dt.strftime('%I:%M:%S %p')} IST")
         save_queue_to_drive(service, q_file_id, folder_id, queue)
 
-    if now_ist < target_dt:
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.environ.get("FORCE_PUBLISH", "").lower() in ["true", "1", "yes"]
+    if now_ist < target_dt and not is_manual:
         diff_mins = int((target_dt - now_ist).total_seconds() // 60)
         log(f"Today's upload (Day #{next_item['id']} - {next_item['title']}) is organically scheduled for {target_dt.strftime('%I:%M:%S %p')} IST (~{diff_mins} mins remaining). Standing by.")
         return
+    elif is_manual and now_ist < target_dt:
+        log(f"Manual trigger detected! Bypassing organic schedule target ({target_dt.strftime('%I:%M:%S %p')} IST) to publish immediately.")
 
     content_type = next_item.get("content_type", "10s_short")
     log(f"Scheduled target time ({target_dt.strftime('%I:%M:%S %p')} IST) reached! Publishing Day {next_item['id']} [{content_type.upper()}] - {next_item['title']}...")
