@@ -18,6 +18,7 @@ import random
 import requests
 from datetime import datetime, timezone, timedelta
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -42,12 +43,30 @@ def get_random_target_for_day(date_obj):
     return date_obj.replace(hour=hour, minute=minute, second=second, microsecond=0)
 
 def get_drive_service():
+    # 1. Prefer permanent Service Account for Google Drive (never expires!)
+    sa_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            creds_info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+            return build('drive', 'v3', credentials=creds)
+        except Exception as sa_err:
+            log(f"[WARNING] Service account connection failed: {sa_err}. Falling back to OAuth token...")
+
+    # 2. Fallback to OAuth token
     token_json = os.environ.get("GOOGLE_TOKEN_JSON")
     if token_json:
-        creds_info = json.loads(token_json)
-        creds = Credentials.from_authorized_user_info(creds_info, scopes=SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        try:
+            creds_info = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(creds_info, scopes=SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            return build('drive', 'v3', credentials=creds)
+        except Exception as token_err:
+            log(f"[WARNING] OAuth token connection failed: {token_err}")
+
+    if os.path.exists("service_account.json"):
+        creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
         return build('drive', 'v3', credentials=creds)
     elif os.path.exists("scibrain_token.json"):
         creds = Credentials.from_authorized_user_file("scibrain_token.json", scopes=SCOPES)
@@ -55,7 +74,7 @@ def get_drive_service():
             creds.refresh(Request())
         return build('drive', 'v3', credentials=creds)
     else:
-        raise ValueError("GOOGLE_TOKEN_JSON not found in environment.")
+        raise ValueError("Neither SERVICE_ACCOUNT_JSON nor GOOGLE_TOKEN_JSON found.")
 
 def find_folder(service, name="SciBrain_Reels"):
     q = f"mimeType = 'application/vnd.google-apps.folder' and name = '{name}' and trashed = false"
